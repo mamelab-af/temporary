@@ -1,0 +1,291 @@
+from typing import IO, Any
+
+import anyio
+from aioboto3.session import Session
+from botocore.exceptions import ClientError
+from types_aiobotocore_kms import KMSClient
+from types_aiobotocore_s3 import S3Client
+from types_aiobotocore_s3.type_defs import (
+  BlobTypeDef,
+  GetObjectOutputTypeDef,
+  HeadObjectOutputTypeDef,
+  ListObjectsV2OutputTypeDef,
+)
+
+from app.utilities import settings
+from app.utilities.logger import get_logger
+
+
+class AsyncS3Handler:
+  def __init__(
+    self,
+    /,
+    bucket_name: str,
+    kms_key_id: str,
+    s3_client: S3Client,
+    kms_client: KMSClient,
+  ):
+    self.__bucket_name = bucket_name
+    self.__kms_key_id = f"alias/{kms_key_id}"
+
+    self.__s3_client = s3_client
+    self.__kms_client = kms_client
+
+    self._logger = get_logger(__name__)
+
+  async def write(
+    self,
+    key: str,
+    body: BlobTypeDef,
+    metadata: dict[str, str] | None = None,
+  ) -> bool:
+    """
+    Notes:
+      SSE-KMS: https://boto3.amazonaws.com/v1/documentation/api/latest/reference/services/s3.html#uploading-downloading-files-using-sse-kms
+    """
+
+    original_size: int
+    if isinstance(body, bytes):
+      original_size = len(body)
+    elif isinstance(body, str):
+      original_size = len(body.encode())
+    elif isinstance(body, IO):
+      original_size = len(await body.read())
+
+    try:
+      _metadata = {"content-type": "text/plain"}
+      if metadata:
+        _metadata.update(metadata)
+      _metadata.update({"original-size": str(original_size)})
+
+      content_type = _metadata.get("content-type", "text/plain")
+
+      await self.__s3_client.put_object(
+        Bucket=self.__bucket_name,
+        Key=key,
+        Body=body,
+        ContentType=content_type,
+        Metadata=_metadata,
+        ServerSideEncryption="aws:kms",
+        SSEKMSKeyId=self.__kms_key_id,
+      )
+    except ClientError:
+      self._logger.exception(f"failed to upload encrypted file to {key}")
+      return False
+
+    return True
+
+  def __is_content_type_text(self, content_type: str) -> bool:
+    return str.startswith(content_type, "text/") or content_type not in (
+      "application/octet-stream",
+      "binary/octet-stream",
+    )
+
+  async def read(self, key: str) -> bytes | None:
+    """
+    Notes:
+      SSE-KMS: https://boto3.amazonaws.com/v1/documentation/api/latest/reference/services/s3.html#uploading-downloading-files-using-sse-kms
+    """
+
+    try:
+      if not self.exists(key):
+        return None
+
+      got_object: GetObjectOutputTypeDef = await self.__s3_client.get_object(
+        Bucket=self.__bucket_name,
+        Key=key,
+      )
+
+      return await got_object["Body"].read()
+    except ClientError:
+      self._logger.exception(f"AWS operation failed for {key}")
+      return None
+
+  async def read_lines(self, key: str) -> list[bytes] | None:
+    """
+    Notes:
+      SSE-KMS: https://boto3.amazonaws.com/v1/documentation/api/latest/reference/services/s3.html#uploading-downloading-files-using-sse-kms
+    """
+
+    try:
+      if not self.exists(key):
+        return None
+
+      got_object: GetObjectOutputTypeDef = await self.__s3_client.get_object(
+        Bucket=self.__bucket_name,
+        Key=key,
+      )
+
+      return await got_object["Body"].readlines()
+    except ClientError:
+      self._logger.exception(f"AWS operation failed for {key}")
+      return None
+
+  async def list(self, prefix: str = "") -> ListObjectsV2OutputTypeDef | None:
+    try:
+      return await self.__s3_client.list_objects_v2(
+        Bucket=self.__bucket_name,
+        Prefix=prefix,
+      )
+    except ClientError:
+      self._logger.exception("Failed to list objects")
+      return None
+
+  async def head(self, key: str) -> HeadObjectOutputTypeDef | None:
+    try:
+      return await self.__s3_client.head_object(Bucket=self.__bucket_name, Key=key)
+    except ClientError:
+      self._logger.exception(f"Failed to get metadata for {key}")
+      return None
+
+  async def get(self, key: str) -> GetObjectOutputTypeDef | None:
+    try:
+      return await self.__s3_client.get_object(Bucket=self.__bucket_name, Key=key)
+    except ClientError:
+      self._logger.exception(f"Failed to get metadata for {key}")
+      return None
+
+  async def copy(
+    self,
+    src_key: str,
+    dest_key: str,
+    metadata: dict[str, str] | None = None,
+  ) -> bool:
+    try:
+      await self.__s3_client.copy_object(
+        CopySource={
+          "Bucket": self.__bucket_name,
+          "Key": src_key,
+        },
+        Bucket=self.__bucket_name,
+        Key=dest_key,
+        Metadata=metadata or {},
+        ServerSideEncryption="aws:kms",
+        SSEKMSKeyId=self.__kms_key_id,
+      )
+      self._logger.info(f"copy from {src_key} to {dest_key} was successful")
+    except ClientError:
+      self._logger.exception("copy from {src_key} to {dest_key} failed")
+      return False
+
+    return True
+
+  async def upload(
+    self,
+    src_file_path: str,
+    dest_key: str,
+    metadata: dict[str, str] | None = None,
+  ) -> bool:
+    try:
+      async with await anyio.open_file(file=src_file_path, mode="rb") as file:
+        read_data = await file.read()
+        text_content = read_data.decode()
+    except OSError:
+      self._logger.exception(f"failed to read file '{src_file_path}'")
+      return False
+
+    return await self.write(
+      body=text_content,
+      key=dest_key,
+      metadata=metadata,
+    )
+
+  async def download(self, src_key: str, dest_file_path: str) -> bool:
+    try:
+      await self.__s3_client.download_file(
+        Bucket=self.__bucket_name,
+        Key=src_key,
+        Filename=dest_file_path,
+      )
+      self._logger.info(f"download from '{src_key}' to '{dest_file_path}' was successful")
+
+    except ClientError:
+      self._logger.exception(f"download from '{src_key}' to '{dest_file_path}' failed")
+      return False
+
+    return True
+
+  async def delete(self, key: str) -> bool:
+    try:
+      await self.__s3_client.delete_object(Bucket=self.__bucket_name, Key=key)
+      self._logger.info(f"Successfully deleted {key}")
+    except ClientError:
+      self._logger.exception(f"Failed to delete {key}")
+      return False
+    return True
+
+  async def revive(self, key: str = "") -> bool:
+    try:
+      versions = await self.__s3_client.list_object_versions(Bucket=self.__bucket_name, Prefix=key)
+      if versions["DeleteMarkers"]:
+        self._logger.exception("object is not deleted")
+        return False
+
+      version_id = versions["DeleteMarkers"][0]["VersionId"]
+      await self.__s3_client.delete_object(Bucket=self.__bucket_name, Key=key, VersionId=version_id)
+
+    except ClientError:
+      self._logger.exception("Failed to revive object")
+      return False
+
+    return True
+
+  async def exists(self, key: str) -> bool:
+    try:
+      result: HeadObjectOutputTypeDef = await self.__s3_client.head_object(
+        Bucket=self.__bucket_name,
+        Key=key,
+      )
+      if self.__is_kms_encrypt_object(result):
+        return await self.__check_encrypt_key(result)
+    except ClientError:
+      return False
+
+    return True
+
+  async def __check_encrypt_key(self, s3_info: HeadObjectOutputTypeDef) -> bool:
+    key_info = await self.__kms_client.describe_key(KeyId=self.__kms_key_id)
+    return key_info["KeyMetadata"]["Arn"] == s3_info["SSEKMSKeyId"]
+
+  def __is_kms_encrypt_object(self, s3_info: HeadObjectOutputTypeDef) -> bool:
+    return s3_info["ServerSideEncryption"] == "aws:kms"
+
+
+class AsyncS3HandlerCreator:
+  def __init__(
+    self,
+    /,
+    session: Session,
+    bucket_name: str,
+    kms_key_id: str,
+    region_name: str | None = None,
+    s3_endpoint_url: str | None = None,
+    kms_endpoint_url: str | None = None,
+  ):
+    self.__bucket_name = bucket_name
+    self.__kms_key_id = f"alias/{kms_key_id}"
+
+    self.__s3_client_creator = session.client(
+      "s3",
+      region_name=region_name,
+      endpoint_url=s3_endpoint_url if s3_endpoint_url else settings.envvar.aws_s3_endpoint_url,
+    )
+    self.__kms_client_creator = session.client(
+      "kms",
+      region_name=region_name,
+      endpoint_url=kms_endpoint_url if kms_endpoint_url else settings.envvar.aws_s3_endpoint_url,
+    )
+
+  async def __aenter__(self) -> AsyncS3Handler:
+    s3_client = await self.__s3_client_creator.__aenter__()
+    kms_client = await self.__kms_client_creator.__aenter__()
+    return AsyncS3Handler(
+      bucket_name=self.__bucket_name,
+      kms_key_id=self.__kms_key_id,
+      s3_client=s3_client,
+      kms_client=kms_client,
+    )
+
+  async def __aexit__(self, type_: Any, value: Any, traceback: Any) -> None:  # noqa: PYI036
+    await self.__s3_client_creator.__aexit__(type_, value, traceback)
+    await self.__kms_client_creator.__aexit__(type_, value, traceback)
